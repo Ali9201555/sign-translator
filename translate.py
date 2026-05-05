@@ -1,78 +1,66 @@
-"""Live sign-language to speech.
+"""Live sign-language to speech. No training, no recording - just run it.
 
-- Captures webcam frames continuously
-- Maintains a 30-frame sliding window of landmark vectors
-- Runs LSTM inference on the window every frame
-- When a sign is held with confidence > threshold for several frames in a row,
-  it's appended to the sentence and spoken via SAPI5 (pyttsx3)
+Recognizes ASL fingerspelling letters (A B D F I L U V W Y) and common signs
+(yes / hello / I love you). Letters get appended to the current word. The word
+is spoken when your hand leaves view, when you press SPACE, or after you've
+held a different gesture.
 
 Keys:
-  q   quit
-  c   clear current sentence
-  s   speak the current sentence again"""
-import os
+  q          quit
+  c          clear current word
+  space      speak the current word now
+  s          repeat the last spoken phrase
+"""
+import time
 import threading
-from collections import deque
-import numpy as np
 import cv2
 import pyttsx3
 
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+from tracker import HandTracker
+from recognizer import classify
 
-from tensorflow.keras.models import load_model
-from tracker import HolisticTracker
 
-MODEL_PATH = "models/sign_lstm.keras"
-LABELS_PATH = "models/labels.txt"
-SEQUENCE_LENGTH = 30
-CONF_THRESHOLD = 0.85
-STABLE_FRAMES = 5  # how many consecutive frames a prediction must hold
+STABLE_FRAMES = 8        # frames a label must hold to be accepted
+NEW_LETTER_GAP = 12      # frames between accepting the same letter twice in a row
+WORD_TIMEOUT = 1.2       # seconds with no hand visible -> speak the word
 
 
 class Speaker:
-    """Background TTS so speech doesn't block the camera loop."""
     def __init__(self):
-        self._engine = pyttsx3.init()
-        self._engine.setProperty('rate', 175)
+        self.engine = pyttsx3.init()
+        self.engine.setProperty('rate', 175)
         self._lock = threading.Lock()
 
     def say(self, text):
+        if not text:
+            return
         threading.Thread(target=self._say_blocking, args=(text,), daemon=True).start()
 
     def _say_blocking(self, text):
         with self._lock:
-            self._engine.say(text)
-            self._engine.runAndWait()
+            self.engine.say(text)
+            self.engine.runAndWait()
 
 
 def main():
-    if not os.path.exists(MODEL_PATH):
-        print(f"No trained model found at {MODEL_PATH}.")
-        print("Run collect_data.py for at least 2 signs, then train.py first.")
-        return
-
-    print("Loading model...")
-    model = load_model(MODEL_PATH)
-    with open(LABELS_PATH, encoding="utf-8") as f:
-        labels = [line.strip() for line in f if line.strip()]
-    print(f"Loaded {len(labels)} sign(s): {labels}")
-
     cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
     if not cap.isOpened():
         cap = cv2.VideoCapture(0)
     if not cap.isOpened():
-        print("Could not open camera.")
+        print("Could not open camera. Make sure no other app is using it.")
         return
 
-    tracker = HolisticTracker()
+    tracker = HandTracker()
     speaker = Speaker()
+    speaker.say("Sign translator ready")
+    print("Sign Translator running. Press q to quit.")
 
-    window = deque(maxlen=SEQUENCE_LENGTH)
-    sentence = []
-    last_pred = None
-    consecutive = 0
-    last_conf = 0.0
+    current_word = ""
     last_label = ""
+    label_streak = 0
+    frames_since_committed = 999
+    last_hand_seen = time.time()
+    history = []
 
     try:
         while True:
@@ -81,63 +69,80 @@ def main():
                 continue
             frame = cv2.flip(frame, 1)
             results = tracker.process(frame)
-            tracker.draw(frame, results)
-            features = tracker.extract_features(results)
-            window.append(features)
 
-            if len(window) == SEQUENCE_LENGTH and tracker.has_hands(results):
-                X = np.expand_dims(np.array(window, dtype=np.float32), axis=0)
-                probs = model.predict(X, verbose=0)[0]
-                idx = int(np.argmax(probs))
-                conf = float(probs[idx])
-                last_label = labels[idx]
-                last_conf = conf
+            label, conf = "?", 0.0
+            now = time.time()
 
-                if conf > CONF_THRESHOLD:
-                    if last_label == last_pred:
-                        consecutive += 1
-                    else:
-                        last_pred = last_label
-                        consecutive = 1
+            if results.multi_hand_landmarks:
+                last_hand_seen = now
+                pts = HandTracker.landmarks_to_array(results.multi_hand_landmarks[0])
+                label, conf = classify(pts)
+                tracker.draw(frame, results)
 
-                    if consecutive == STABLE_FRAMES:
-                        if not sentence or sentence[-1] != last_label:
-                            sentence.append(last_label)
-                            speaker.say(last_label)
-                            if len(sentence) > 10:
-                                sentence = sentence[-10:]
+                if label != "?" and label == last_label:
+                    label_streak += 1
                 else:
-                    consecutive = 0
+                    last_label = label
+                    label_streak = 1
+
+                if label_streak == STABLE_FRAMES and label != "?":
+                    if len(label) == 1:
+                        # single letter
+                        if not current_word or current_word[-1] != label or frames_since_committed > NEW_LETTER_GAP:
+                            current_word += label
+                            frames_since_committed = 0
+                    else:
+                        # full word/phrase: flush any pending letters first
+                        if current_word:
+                            speaker.say(current_word)
+                            history.append(current_word)
+                            current_word = ""
+                        speaker.say(label)
+                        history.append(label)
+                        frames_since_committed = 0
+
+                frames_since_committed += 1
             else:
-                last_label = ""
-                last_conf = 0.0
-                consecutive = 0
+                if current_word and (now - last_hand_seen) > WORD_TIMEOUT:
+                    speaker.say(current_word)
+                    history.append(current_word)
+                    current_word = ""
+                    last_label = ""
+                    label_streak = 0
 
             # HUD
             h, w = frame.shape[:2]
-            cv2.rectangle(frame, (0, 0), (w, 45), (0, 0, 0), -1)
-            cv2.putText(frame, " ".join(sentence) if sentence else "(speak with your hands...)",
-                        (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+            cv2.rectangle(frame, (0, 0), (w, 60), (0, 0, 0), -1)
+            cv2.putText(frame, f"Word: {current_word}_", (10, 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            recent = " ".join(history[-5:]) if history else "(spoken history)"
+            cv2.putText(frame, recent, (10, 53),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
 
-            cv2.rectangle(frame, (0, h - 35), (w, h), (0, 0, 0), -1)
-            if last_label:
-                bar = int(min(last_conf, 1.0) * 200)
-                cv2.rectangle(frame, (10, h - 22), (10 + bar, h - 12), (0, 255, 0), -1)
-                cv2.putText(frame, f"{last_label}  {last_conf:.2f}",
-                            (220, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            cv2.putText(frame, "q=quit  c=clear  s=replay",
-                        (w - 240, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            cv2.rectangle(frame, (0, h - 40), (w, h), (0, 0, 0), -1)
+            if label != "?":
+                bar = int(min(conf, 1.0) * 200)
+                cv2.rectangle(frame, (10, h - 25), (10 + bar, h - 13), (0, 255, 0), -1)
+                stab = min(label_streak, STABLE_FRAMES)
+                cv2.putText(frame, f"{label}  conf {conf:.2f}  hold {stab}/{STABLE_FRAMES}",
+                            (220, h - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1)
+            cv2.putText(frame, "q=quit  c=clear  space=speak",
+                        (w - 270, h - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
 
             cv2.imshow("Sign Translator", frame)
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 break
             elif key == ord('c'):
-                sentence = []
-                last_pred = None
-                consecutive = 0
-            elif key == ord('s') and sentence:
-                speaker.say(" ".join(sentence))
+                current_word = ""
+                last_label = ""
+                label_streak = 0
+            elif key == ord(' ') and current_word:
+                speaker.say(current_word)
+                history.append(current_word)
+                current_word = ""
+            elif key == ord('s') and history:
+                speaker.say(history[-1])
     finally:
         cap.release()
         cv2.destroyAllWindows()
